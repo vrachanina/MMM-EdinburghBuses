@@ -1,0 +1,50 @@
+.edinburgh-buses .stop-block:not(:first-child) {
+    margin-top: 14px;
+}
+
+.edinburgh-buses .stop-name {
+    margin-bottom: 4px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}
+
+.edinburgh-buses .bus {
+    display: flex;
+    flex-direction: row;
+}
+
+.edinburgh-buses .bus:not(:first-child) {
+    margin-top: 8px;
+}
+
+.edinburgh-buses .bus > div:first-child {
+    flex-shrink: 0;
+}
+
+.edinburgh-buses .bus > div:nth-child(2) {
+    flex-grow: 1;
+}
+
+.edinburgh-buses .bus .bus-number {
+    flex-shrink: 0;
+    margin-right: 20px;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+}
+
+.edinburgh-buses .bus .bus-number .number {
+    padding: 0 10px;
+    background-color: #fff;
+    color: #000;
+    border-radius: 10px;
+}
+
+.edinburgh-buses .bus .bus-times {
+    text-align: right;
+}
+
+.edinburgh-buses .attribution {
+    margin-top: 10px;
+    opacity: 0.6;
+}
