@@ -1,18 +1,14 @@
 /* MagicMirror Module: MMM-EdinburghBuses
  *
- * Displays real-time bus departures for specified Edinburgh (Lothian /
- * partner operator) bus stops and, optionally, specific route numbers.
+ * Displays real-time bus departures for specified Edinburgh bus stops and,
+ * optionally, specific route numbers.
  *
- * Data source: Edinburgh Travel Tracker Open API (NOVUS-RT), i.e. the
- * successor to the old mybustracker / tfe-opendata API used by the
- * now-unsupported MMM-LothianBuses module.
- *
- * You need credentials issued by City of Edinburgh Council / Trapeze:
- *   - baseUrl      (host for the Open API, provided on registration)
- *   - accessToken  (path segment used to authenticate the request)
- *   - userKey      (sent as an HTTP header on every request)
- * Request these via the "API Keys" link on
- * https://www.edinburghtraveltracker.com/
+ * Data source: City of Edinburgh Council Open API (Trapeze / Azure API
+ * Management gateway). You need:
+ *   - baseUrl  e.g. https://apim-public.trapezegroupazure.co.uk/edinburgh-cec-openapi/generic/v1.1
+ *   - userKey  your API subscription key
+ * and, if the header differs from the default, userKeyHeader.
+ * Request access via the "API Keys" link on https://www.edinburghtraveltracker.com/
  *
  * Per the API licence terms, any app using this data must display:
  *   "Data provided by City of Edinburgh Council"
@@ -23,14 +19,13 @@ Module.register("MMM-EdinburghBuses", {
     defaults: {
         // --- Credentials (required) ---
         baseUrl: null,
-        accessToken: null,
         userKey: null,
-        userKeyHeader: "User_Key",
+        userKeyHeader: "Ocp-Apim-Subscription-Key",
 
         // --- Stops to display (required) ---
         // Each entry:
-        //   { atcoCode: '6110114', label: 'Princes Street', routes: ['22','30'] }
-        //   { smsCode: '12345678', routes: ['N22'] }
+        //   { smsCode: '36232943', label: 'Wakefield Avenue', routes: ['49'] }
+        //   { atcoCode: '6200241370', label: 'Wakefield Avenue' }
         // 'routes' is optional; omit it to show every service at that stop.
         stops: [],
 
@@ -38,10 +33,12 @@ Module.register("MMM-EdinburghBuses", {
         updateInterval: 30, // seconds between refreshes
         animationSpeed: 1000,
         lookahead: 60, // minutes of look-ahead requested from the API
-        maxEvents: 3, // departures shown per route, per stop (also per-stop override)
+        fetchMaxEvents: 20, // events requested per stop (can be overridden per stop with maxEvents)
+        maxEvents: 3, // departures shown per route, per stop
         eventType: "departure", // 'departure' or 'arrival'
-        timeFormat: "Local", // 'Local' or 'UTC' - keep 'Local' unless your server is on UTC
+        timeFormat: null, // only sent to the API if set
         minVisitsPerService: null,
+        debug: false, // log the first raw event per stop in the MagicMirror log
 
         // --- Display ---
         showStopName: true,
@@ -72,9 +69,9 @@ Module.register("MMM-EdinburghBuses", {
     },
 
     sendConfigAndFetch: function () {
-        if (!this.config.baseUrl || !this.config.accessToken || !this.config.userKey) {
+        if (!this.config.baseUrl || !this.config.userKey) {
             this.isError = true;
-            this.errorMessage = "Module not configured. Please specify baseUrl, accessToken and userKey.";
+            this.errorMessage = "Module not configured. Please specify baseUrl and userKey.";
             this.updateDom(this.config.animationSpeed);
             return;
         }
@@ -97,24 +94,40 @@ Module.register("MMM-EdinburghBuses", {
         }
     },
 
-    // Turn an "HH:mm" string (today, possibly rolling into tomorrow) into
-    // a countdown in minutes from now.
-    minutesUntil: function (hhmm) {
-        if (!hhmm) {
+    // Convert an API time value into minutes from now. Handles:
+    //   - a number: seconds from now (live times inside the countdown window)
+    //   - "HH:mm": a time today (rolled to tomorrow if it looks like after midnight)
+    //   - any other string: parsed as a date-time
+    minutesUntil: function (value) {
+        if (value === null || value === undefined || value === "") {
             return null;
         }
-        const parts = hhmm.split(":");
-        if (parts.length < 2) {
+
+        if (typeof value === "number") {
+            return Math.round(value / 60);
+        }
+
+        if (typeof value !== "string") {
             return null;
         }
-        const target = moment().seconds(0).milliseconds(0).hour(parseInt(parts[0], 10)).minute(parseInt(parts[1], 10));
-        const now = moment();
-        // If the time looks like it's already well in the past, assume it's
-        // for after midnight and roll it forward a day.
-        if (target.diff(now, "minutes") < -360) {
-            target.add(1, "day");
+
+        if (/^\d{1,2}:\d{2}$/.test(value)) {
+            const parts = value.split(":");
+            const target = moment()
+                .seconds(0)
+                .milliseconds(0)
+                .hour(parseInt(parts[0], 10))
+                .minute(parseInt(parts[1], 10));
+            const now = moment();
+            // If the time looks well in the past, assume it is after midnight
+            if (target.diff(now, "minutes") < -360) {
+                target.add(1, "day");
+            }
+            return target.diff(now, "minutes");
         }
-        return target.diff(now, "minutes");
+
+        const parsed = moment(value);
+        return parsed.isValid() ? parsed.diff(moment(), "minutes") : null;
     },
 
     formatMinutes: function (mins) {
@@ -128,16 +141,20 @@ Module.register("MMM-EdinburghBuses", {
     },
 
     // Group a stop's flat event list by route number (publicservicename),
-    // sorted by soonest departure, mirroring the layout of the original
-    // MMM-LothianBuses module.
+    // sorted by soonest departure.
     groupByRoute: function (events) {
+        const isArrival = this.config.eventType === "arrival";
         const byRoute = {};
+
         events.forEach((event) => {
             const route = event.publicservicename || "?";
-            const time = event.departuretime || event.scheduledeparturetime || event.arrivaltime || event.schedulearrivaltime;
-            const isLive = !!(event.departuretime || event.arrivaltime);
-            const mins = this.minutesUntil(time);
-            if (mins === null) {
+            const liveRaw = isArrival ? event.arrivaltime : event.departuretime;
+            const schedRaw = isArrival ? event.schedulearrivaltime : event.scheduledeparturetime;
+            const isLive = typeof liveRaw === "number" || (typeof liveRaw === "string" && liveRaw !== "");
+            const mins = this.minutesUntil(isLive ? liveRaw : schedRaw);
+
+            // Skip events with no usable time, or scheduled-only ones already gone
+            if (mins === null || (!isLive && mins < -1)) {
                 return;
             }
             if (!byRoute[route]) {
@@ -180,7 +197,8 @@ Module.register("MMM-EdinburghBuses", {
         }
 
         const anyEvents = this.results.some((r) => r.events && r.events.length > 0);
-        if (!anyEvents) {
+        const anyErrors = this.results.some((r) => r.error);
+        if (!anyEvents && !anyErrors) {
             wrapper.className = "light small dimmed";
             wrapper.innerHTML = this.translate("No buses");
             return wrapper;
@@ -216,8 +234,7 @@ Module.register("MMM-EdinburghBuses", {
             }
 
             routes.forEach((routeGroup) => {
-                const maxPerRoute = this.config.maxEvents;
-                const departures = routeGroup.departures.slice(0, maxPerRoute);
+                const departures = routeGroup.departures.slice(0, this.config.maxEvents);
 
                 const row = document.createElement("div");
                 row.className = "bus";
